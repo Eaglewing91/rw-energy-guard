@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RW Energy Guard
 // @namespace    eaglewing.rw.energy.guard
-// @version      0.3.0
+// @version      0.3.1
 // @description  Prevents accidental gym training and protects stacked energy when a Ranked War is pending.
 // @author       Eaglewing [571041]
 // @match        https://www.torn.com/gym.php*
@@ -12,7 +12,10 @@
 // @grant        GM_addStyle
 // @grant        GM_notification
 // @connect      api.torn.com
+// @downloadURL  https://raw.githubusercontent.com/Eaglewing91/rw-energy-guard/main/rw-energy-guard.user.js
+// @updateURL    https://raw.githubusercontent.com/Eaglewing91/rw-energy-guard/main/rw-energy-guard.user.js
 // ==/UserScript==
+
 
 (function () {
   'use strict';
