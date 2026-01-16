@@ -16,7 +16,6 @@
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/rw-energy-guard/main/rw-energy-guard.user.js
 // ==/UserScript==
 
-
 (function () {
   'use strict';
 
@@ -25,18 +24,26 @@
   const API_FACTION = 'https://api.torn.com/faction/';
   const FETCH_TIMEOUT_MS = 10000;
 
+  // Stored locally in Tampermonkey
   const API_KEY_STORE = 'rw_energy_guard_api_key_v1';
 
+  // Cache to avoid hammering API
   const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+  // "Don't ask again" duration
   const SUPPRESS_MS = 30 * 60 * 1000; // 30 minutes
   const SUPPRESS_KEY = 'rw_energy_guard_suppress_until_v1';
 
+  // Only treat wars within this window as "pending" (future start within N days)
   const SCHEDULE_WINDOW_DAYS = 14;
 
   // Matches: <button type="button" class="torn-btn" aria-label="Train speed">TRAIN</button>
   const TRAIN_BTN_SELECTOR = 'button.torn-btn[type="button"][aria-label^="Train "]';
 
+  // Internal bypass to allow the single re-click after confirmation
   let bypassOnce = false;
+
+  // Track whether modal is open (for safety / cleanup)
   let modalOpen = false;
 
   /* ----------------- STYLES ----------------- */
@@ -103,6 +110,14 @@
       user-select: none;
     }
 
+    /* Countdown highlight */
+    #rwEG_countdown {
+      font-weight: 900;
+      color: #ff4d4d;
+      font-size: 14px;
+    }
+
+    /* Visual cue when we hard-block buttons */
     .rwEG_blocked {
       opacity: .55 !important;
       filter: grayscale(25%);
@@ -192,10 +207,7 @@
     if (!info || typeof info !== 'object') return { startTs: null, endTs: null };
     const sF = ['start', 'start_time', 'start_timestamp', 'start_date', 'startDate', 'starts_at', 'begin', 'begin_time', 'begin_timestamp', 'startTime'];
     const eF = ['end', 'end_time', 'end_timestamp', 'end_date', 'endDate', 'ends_at', 'finish', 'finish_time', 'finish_timestamp', 'endTime'];
-
-    let st = null;
-    let et = null;
-
+    let st = null, et = null;
     for (const f of sF) {
       if (Object.prototype.hasOwnProperty.call(info, f)) {
         const p = parseTs(info[f]);
@@ -232,13 +244,11 @@
     function find(node) {
       if (!node || typeof node !== 'object') return;
       const keys = Object.keys(node);
-      const low = keys.map((k) => k.toLowerCase());
-      const hasTime = low.some((k) => /(start|end|time|timestamp|date)/.test(k));
-      const hasStatus = low.some((k) => /(status|state|active|scheduled|match)/.test(k));
-      const hasOpponent = low.some((k) => /(opponent|faction_name|enemy)/.test(k));
-
+      const low = keys.map(k => k.toLowerCase());
+      const hasTime = low.some(k => /(start|end|time|timestamp|date)/.test(k));
+      const hasStatus = low.some(k => /(status|state|active|scheduled|match)/.test(k));
+      const hasOpponent = low.some(k => /(opponent|faction_name|enemy)/.test(k));
       if (hasTime || hasStatus || hasOpponent) res.push(node);
-
       for (const k of keys) {
         const v = node[k];
         if (v && typeof v === 'object') find(v);
@@ -269,6 +279,14 @@
     return `${y}-${mo}-${da} ${hh}:${mm}`;
   }
 
+  function formatCountdown(seconds) {
+    if (seconds <= 0) return 'STARTING NOW';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+  }
+
   async function isSuppressed() {
     const until = Number(await GM_getValue(SUPPRESS_KEY, 0)) || 0;
     return Date.now() < until;
@@ -284,7 +302,7 @@
     for (const btn of btns) {
       if (blocked) {
         btn.dataset.rwEgBlocked = '1';
-        btn.style.pointerEvents = 'none';
+        btn.style.pointerEvents = 'none'; // hard stop
         btn.classList.add('rwEG_blocked');
       } else {
         btn.dataset.rwEgBlocked = '';
@@ -353,11 +371,13 @@
       const { startTs } = getWarTimes(obj);
       const pendingByStatus = looksPending(obj);
 
+      // Primary: future start time within window
       if (startTs && startTs > now && (startTs - now) <= windowSecs) {
         if (!best || startTs < best.startTs) best = { obj, startTs };
         continue;
       }
 
+      // Fallback: has "pending" but no timestamp
       if (!startTs && pendingByStatus) {
         if (!best) best = { obj, startTs: null };
       }
@@ -370,7 +390,7 @@
       factionId,
       pending: !!best,
       startTs: best?.startTs || null,
-      opponent: opponent || null,
+      opponent: opponent || null
     };
 
     rwCache.ts = nowMs;
@@ -402,7 +422,11 @@
       <h3>Confirm gym training</h3>
       <div class="line">You clicked: <b>${escapeHtml(trainLabel || 'TRAIN')}</b></div>
       <div class="line">Your faction has a <b>pending Ranked War</b>.</div>
-      <div class="line"><b>Start:</b> ${escapeHtml(when)} ${opp ? `<b>(${escapeHtml(opp)})</b>` : ''}</div>
+      <div class="line">
+        <b>Start:</b>
+        <span id="rwEG_countdown">${state.startTs ? 'Calculating…' : escapeHtml(when)}</span>
+        ${opp ? `<b>(${escapeHtml(opp)})</b>` : ''}
+      </div>
       <div class="warn">Training is blocked unless you explicitly confirm.</div>
 
       <div class="footer">
@@ -418,11 +442,33 @@
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
+    // Live countdown (local only; no extra API calls)
+    let countdownTimer = null;
+    if (state.startTs) {
+      const el = document.getElementById('rwEG_countdown');
+      const tick = () => {
+        const now = Math.floor(Date.now() / 1000);
+        const remaining = state.startTs - now;
+        el.textContent = formatCountdown(remaining);
+      };
+      tick();
+      countdownTimer = setInterval(tick, 1000);
+    }
+
+    const stopTimer = () => {
+      if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+    };
+
     const doCancel = () => {
+      stopTimer();
       try { onCancel?.(); } catch (_) {}
     };
 
     const doContinue = async () => {
+      stopTimer();
       try {
         const chk = modal.querySelector('#rwEG_suppress');
         if (chk?.checked) {
@@ -432,6 +478,7 @@
       try { onContinue?.(); } catch (_) {}
     };
 
+    // background click = cancel
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) doCancel();
     });
@@ -439,6 +486,7 @@
     modal.querySelector('#rwEG_cancel').addEventListener('click', doCancel);
     modal.querySelector('#rwEG_continue').addEventListener('click', doContinue);
 
+    // ESC = cancel
     const escHandler = (e) => {
       if (e.key === 'Escape') {
         window.removeEventListener('keydown', escHandler, true);
@@ -448,20 +496,22 @@
     window.addEventListener('keydown', escHandler, true);
   }
 
-  /* ----------------- INTERCEPT ----------------- */
+  /* ----------------- INTERCEPT ONLY TRAIN BUTTONS ----------------- */
   function getTrainLabel(btn) {
     const aria = btn.getAttribute('aria-label') || '';
-    if (aria.trim()) return aria.trim();
+    if (aria.trim()) return aria.trim(); // e.g. "Train speed"
     return (btn.textContent || 'TRAIN').trim();
   }
 
   function installTrainButtonInterceptor(getState) {
     document.addEventListener('click', async (e) => {
+      // Allow the confirmed re-click through
       if (bypassOnce) return;
 
       const btn = e.target?.closest?.(TRAIN_BTN_SELECTOR);
       if (!btn) return;
 
+      // If modal is already open, block further clicks
       if (modalOpen) {
         e.preventDefault();
         e.stopPropagation();
@@ -469,14 +519,19 @@
         return;
       }
 
+      // If user suppressed prompts, allow normal behavior
       if (await isSuppressed()) return;
 
       const state = await getState();
       if (!state?.ok) return;
+
+      // Only block for PENDING as requested
       if (!state.pending) return;
 
+      // HARD BLOCK: disable all train buttons FIRST (prevents any leakage)
       setTrainButtonsBlocked(true);
 
+      // Block this click
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation?.();
@@ -487,6 +542,7 @@
         state,
         label,
         () => {
+          // CONTINUE: enable, then re-click once
           removeModal();
           setTrainButtonsBlocked(false);
 
@@ -498,12 +554,14 @@
           }
         },
         () => {
+          // CANCEL: enable, do not train
           removeModal();
           setTrainButtonsBlocked(false);
         }
       );
     }, true);
 
+    // Safety: if tab returns visible and no modal, ensure buttons aren't left blocked
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && !modalOpen) {
         setTrainButtonsBlocked(false);
@@ -524,10 +582,12 @@
       }
     }
 
+    // Never leave buttons locked
     window.addEventListener('beforeunload', () => safeUnblock());
 
     installTrainButtonInterceptor(getState);
 
+    // Warm cache once
     getState().catch(() => {});
   }
 
