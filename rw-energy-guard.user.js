@@ -1,50 +1,70 @@
 // ==UserScript==
 // @name         RW Energy Guard
 // @namespace    eaglewing.rw.energy.guard
-// @version      0.3.1
+// @version      0.4.0
 // @description  Prevents accidental gym training and protects stacked energy when a Ranked War is pending.
 // @author       Eaglewing [571041]
 // @match        https://www.torn.com/gym.php*
 // @run-at       document-idle
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_addStyle
-// @grant        GM_notification
+// @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
 // @downloadURL  https://raw.githubusercontent.com/Eaglewing91/rw-energy-guard/main/rw-energy-guard.user.js
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/rw-energy-guard/main/rw-energy-guard.user.js
+// @license      MIT
 // ==/UserScript==
+
+// Terms of Service
+// | Data Storage                 | Data Sharing | Purpose of Use                             | Key Storage & Sharing             | Key Access Level                  |
+// |------------------------------|--------------|--------------------------------------------|-----------------------------------|-----------------------------------|
+// | No / Only locally (API key,  | Nobody       | Other (mistake prevention: asks for        | Stored locally / Not shared; sent | Public (faction rankedwars,       |
+// | faction ID and "don't ask    |              | confirmation before gym training while     | only to api.torn.com              | faction basic)                    |
+// | again" time in Tampermonkey; |              | your faction has a pending ranked war)     |                                   |                                   |
+// | war status in memory only)   |              |                                            |                                   |                                   |
+//
+// Network use: only Torn API v2 requests to api.torn.com, sent with the key in
+// the Authorization header. War status is fetched in the background (allowed
+// for the API); the TRAIN click itself is never repeated or automated. One
+// "Train anyway" click causes exactly one click on the TRAIN button you chose.
 
 (function () {
   'use strict';
 
   /* ----------------- SETTINGS ----------------- */
-  const API_USER = 'https://api.torn.com/user/';
-  const API_FACTION = 'https://api.torn.com/faction/';
-  const FETCH_TIMEOUT_MS = 10000;
+  const API = 'https://api.torn.com/v2/';
+  const REQUEST_TIMEOUT_MS = 10000;
+  const REFRESH_MS = 5 * 60 * 1000;          // war status refresh interval
+  const SUPPRESS_MS = 30 * 60 * 1000;        // "Don't ask again" duration
+  const SCHEDULE_WINDOW_DAYS = 14;           // only wars starting within this window count as pending
 
-  // Stored locally in Tampermonkey
   const API_KEY_STORE = 'rw_energy_guard_api_key_v1';
-
-  // Cache to avoid hammering API
-  const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-  // "Don't ask again" duration
-  const SUPPRESS_MS = 30 * 60 * 1000; // 30 minutes
   const SUPPRESS_KEY = 'rw_energy_guard_suppress_until_v1';
-
-  // Only treat wars within this window as "pending" (future start within N days)
-  const SCHEDULE_WINDOW_DAYS = 14;
+  const PROMPTED_KEY = 'rw_energy_guard_key_prompted_v1';
+  const FACTION_ID_KEY = 'rw_energy_guard_faction_id_v1';
 
   // Matches: <button type="button" class="torn-btn" aria-label="Train speed">TRAIN</button>
   const TRAIN_BTN_SELECTOR = 'button.torn-btn[type="button"][aria-label^="Train "]';
 
-  // Internal bypass to allow the single re-click after confirmation
-  let bypassOnce = false;
+  const API_ERRORS = {
+    2: 'Incorrect API key.',
+    6: 'Faction not found. Join a faction to use the guard.',
+    7: 'Your faction\'s ranked wars are not visible to this key.',
+    10: 'This key\'s owner is in federal jail.',
+    13: 'This key is disabled because its owner has been inactive.',
+    16: 'This key\'s access level is too low.',
+    18: 'This key is paused.'
+  };
 
-  // Track whether modal is open (for safety / cleanup)
-  let modalOpen = false;
+  let apiKey = String(GM_getValue(API_KEY_STORE, '') || '').trim();
+  let suppressUntil = Number(GM_getValue(SUPPRESS_KEY, 0)) || 0;
+  let state = null;          // last war status: { ok, pending, startTs, opponent, reason, at }
+  let inFlight = null;       // pending refresh promise
+  let bypassOnce = false;    // lets the single confirmed re-click through
+  let modalCleanup = null;   // closes the open modal, if any
 
   /* ----------------- STYLES ----------------- */
   GM_addStyle(`
@@ -63,28 +83,10 @@
       font-family: Arial, sans-serif;
       padding: 16px 16px 14px;
     }
-    #rwEG_modal h3 {
-      margin: 0 0 10px;
-      font-size: 16px;
-      letter-spacing: .2px;
-    }
-    #rwEG_modal .line {
-      font-size: 13px;
-      line-height: 1.35;
-      color: #d5ffe6;
-      margin: 6px 0;
-    }
-    #rwEG_modal .warn {
-      margin-top: 10px;
-      font-size: 12px;
-      color: #ffd28a;
-      opacity: .95;
-    }
-    #rwEG_modal .actions {
-      display: flex; gap: 10px; justify-content: flex-end;
-      margin-top: 14px;
-      flex-wrap: wrap;
-    }
+    #rwEG_modal h3 { margin: 0 0 10px; font-size: 16px; letter-spacing: .2px; }
+    #rwEG_modal .line { font-size: 13px; line-height: 1.35; color: #d5ffe6; margin: 6px 0; }
+    #rwEG_modal .warn { margin-top: 10px; font-size: 12px; color: #ffd28a; opacity: .95; }
+    #rwEG_modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap; }
     #rwEG_modal button {
       border-radius: 10px;
       border: 1px solid rgba(255,255,255,.10);
@@ -100,27 +102,16 @@
       border-color: rgba(255,70,70,.45);
     }
     #rwEG_modal button:hover { filter: brightness(1.06); }
-    #rwEG_modal .footer {
-      display:flex; align-items:center; justify-content: space-between;
-      margin-top: 10px; gap: 12px; flex-wrap: wrap;
-    }
-    #rwEG_modal label {
-      display: inline-flex; align-items: center; gap: 8px;
-      font-size: 12px; color: #c7ffe0;
-      user-select: none;
-    }
-
-    /* Countdown highlight */
-    #rwEG_countdown {
-      font-weight: 900;
-      color: #ff4d4d;
-      font-size: 14px;
-    }
-
-    /* Visual cue when we hard-block buttons */
-    .rwEG_blocked {
-      opacity: .55 !important;
-      filter: grayscale(25%);
+    #rwEG_modal .footer { display:flex; align-items:center; justify-content: space-between; margin-top: 10px; gap: 12px; flex-wrap: wrap; }
+    #rwEG_modal label { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: #c7ffe0; user-select: none; }
+    #rwEG_countdown { font-weight: 900; color: #ff4d4d; font-size: 14px; }
+    .rwEG_blocked { opacity: .55 !important; filter: grayscale(25%); }
+    #rwEG_toast {
+      position: fixed; right: 16px; bottom: 16px; z-index: 1000001;
+      max-width: min(360px, 90vw); padding: 10px 12px;
+      background: #0b0d0f; color: #ffd28a; border: 1px solid rgba(255,210,138,.35);
+      border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.6);
+      font: 12px/1.4 Arial, sans-serif;
     }
   `);
 
@@ -129,468 +120,277 @@
   GM_registerMenuCommand('RW Energy Guard: Clear API key', clearApiKey);
   GM_registerMenuCommand('RW Energy Guard: Reset “Don’t ask again”', resetSuppress);
 
-  async function setApiKey() {
-    const current = (await GM_getValue(API_KEY_STORE, '')) || '';
-    const k = prompt('RW Energy Guard: Enter your Torn API key (stored locally in Tampermonkey).', current);
+  function setApiKey() {
+    const k = prompt('RW Energy Guard: Enter your Torn API key (a Public key is enough). It is stored locally in Tampermonkey.', apiKey);
     if (k === null) return;
     const t = k.trim();
-    if (!t) return alert('Empty key — not saved.');
-    await GM_setValue(API_KEY_STORE, t);
-    GM_notification?.('API key saved (local)', 'RW Energy Guard');
-    location.reload();
+    if (!/^[A-Za-z0-9]{16}$/.test(t)) return alert('That does not look like a 16-character Torn API key. Not saved.');
+    GM_setValue(API_KEY_STORE, t);
+    GM_setValue(FACTION_ID_KEY, 0);
+    apiKey = t;
+    state = null;
+    toast('API key saved. Checking ranked war status…');
+    refreshState(true);
   }
 
-  async function clearApiKey() {
-    if (!confirm('RW Energy Guard: Clear stored API key?')) return;
-    await GM_setValue(API_KEY_STORE, '');
-    GM_notification?.('API key cleared', 'RW Energy Guard');
-    location.reload();
+  function clearApiKey() {
+    if (!confirm('RW Energy Guard: Clear stored API key? Gym training will no longer be guarded.')) return;
+    GM_setValue(API_KEY_STORE, '');
+    GM_setValue(FACTION_ID_KEY, 0);
+    apiKey = '';
+    state = null;
+    toast('API key cleared. Gym training is not being guarded.');
   }
 
-  async function resetSuppress() {
-    await GM_setValue(SUPPRESS_KEY, 0);
-    GM_notification?.('Confirmation will show again (if applicable).', 'RW Energy Guard');
+  function resetSuppress() {
+    suppressUntil = 0;
+    GM_setValue(SUPPRESS_KEY, 0);
+    toast('Confirmation will show again when a ranked war is pending.');
   }
 
   /* ----------------- HELPERS ----------------- */
-  function fetchWithTimeout(resource, options = {}) {
-    const { timeout = FETCH_TIMEOUT_MS } = options;
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    return fetch(resource, { ...options, signal: controller.signal }).finally(() => clearTimeout(id));
+  function toast(text, ms = 6000) {
+    document.getElementById('rwEG_toast')?.remove();
+    const el = document.createElement('div');
+    el.id = 'rwEG_toast';
+    el.setAttribute('role', 'status');
+    el.textContent = 'RW Energy Guard: ' + text;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), ms);
   }
 
-  async function ensureApiKey() {
-    const stored = await GM_getValue(API_KEY_STORE, '');
-    if (stored && stored.trim()) return stored.trim();
-
-    const k = prompt('RW Energy Guard: Enter your Torn API key to enable Ranked War detection.\n(It will be stored locally.)');
-    if (!k || !k.trim()) return null;
-    await GM_setValue(API_KEY_STORE, k.trim());
-    return k.trim();
+  // Torn API v2 GET with the key in the Authorization header (never in the URL).
+  function api(path, params = {}) {
+    const url = new URL(API + path);
+    Object.entries({ ...params, comment: 'RWEnergyGuard' }).forEach(([k, v]) => url.searchParams.set(k, v));
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: url.href,
+        headers: { Authorization: 'ApiKey ' + apiKey },
+        timeout: REQUEST_TIMEOUT_MS,
+        onload: (res) => {
+          let data = null;
+          try { data = JSON.parse(res.responseText); } catch (_) { /* handled below */ }
+          if (data?.error) {
+            const code = Number(data.error.code);
+            return reject(new Error(API_ERRORS[code] || ('API error ' + code + ': ' + (data.error.error || 'request denied'))));
+          }
+          if (res.status !== 200 || !data) return reject(new Error('Torn API HTTP ' + res.status + '.'));
+          resolve(data);
+        },
+        onerror: () => reject(new Error('Could not reach the Torn API.')),
+        ontimeout: () => reject(new Error('The Torn API timed out.'))
+      });
+    });
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (m) => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#039;',
-    }[m]));
-  }
-
-  function extractFactionIdFromUserJson(json) {
-    if (!json || typeof json !== 'object') return null;
-    if (json.faction_id) return json.faction_id;
-    if (json.faction && typeof json.faction === 'object' && (json.faction.id || json.faction.faction_id)) {
-      return json.faction.id || json.faction.faction_id;
-    }
-    if (json.profile && json.profile.faction_id) return json.profile.faction_id;
-    if (json.basic && json.basic.faction_id) return json.basic.faction_id;
-    return null;
-  }
-
-  function parseTs(v) {
-    if (v == null) return null;
-    if (typeof v === 'number' && v > 100000000) return Math.floor(v);
-    if (typeof v === 'string') {
-      const s = v.trim();
-      if (/^\d{9,12}$/.test(s)) return parseInt(s.slice(0, 10), 10);
-      const p = Date.parse(s);
-      if (!Number.isNaN(p)) return Math.floor(p / 1000);
-    }
-    return null;
-  }
-
-  function getWarTimes(info) {
-    if (!info || typeof info !== 'object') return { startTs: null, endTs: null };
-    const sF = ['start', 'start_time', 'start_timestamp', 'start_date', 'startDate', 'starts_at', 'begin', 'begin_time', 'begin_timestamp', 'startTime'];
-    const eF = ['end', 'end_time', 'end_timestamp', 'end_date', 'endDate', 'ends_at', 'finish', 'finish_time', 'finish_timestamp', 'endTime'];
-    let st = null, et = null;
-    for (const f of sF) {
-      if (Object.prototype.hasOwnProperty.call(info, f)) {
-        const p = parseTs(info[f]);
-        if (p) { st = p; break; }
-      }
-    }
-    for (const f of eF) {
-      if (Object.prototype.hasOwnProperty.call(info, f)) {
-        const p = parseTs(info[f]);
-        if (p) { et = p; break; }
-      }
-    }
-    return { startTs: st, endTs: et };
-  }
-
-  function extractOpponentName(obj) {
-    if (!obj || typeof obj !== 'object') return null;
-    for (const k of Object.keys(obj)) {
-      const lk = k.toLowerCase();
-      if (/(opponent|opponent_faction|opponent_name|faction_name|enemy)/.test(lk)) {
-        const v = obj[k];
-        if (typeof v === 'string' && v.trim()) return v.trim();
-        if (typeof v === 'object' && v) {
-          if (v.faction_name) return v.faction_name;
-          if (v.name) return v.name;
-        }
-      }
-    }
-    return null;
-  }
-
-  function collectWarObjects(root) {
-    const res = [];
-    function find(node) {
-      if (!node || typeof node !== 'object') return;
-      const keys = Object.keys(node);
-      const low = keys.map(k => k.toLowerCase());
-      const hasTime = low.some(k => /(start|end|time|timestamp|date)/.test(k));
-      const hasStatus = low.some(k => /(status|state|active|scheduled|match)/.test(k));
-      const hasOpponent = low.some(k => /(opponent|faction_name|enemy)/.test(k));
-      if (hasTime || hasStatus || hasOpponent) res.push(node);
-      for (const k of keys) {
-        const v = node[k];
-        if (v && typeof v === 'object') find(v);
-      }
-    }
-    find(root);
-    return res;
-  }
-
-  function looksPending(obj) {
-    const status = (obj?.status || obj?.state || obj?.match_status || obj?.war_status);
-    if (status != null) {
-      const v = String(status).toLowerCase();
-      if (/scheduled|pending|upcoming|planned|ready|not_started/.test(v)) return true;
-      if (/active|running|ongoing|in_progress|started|live|current/.test(v)) return false;
-    }
-    return false;
-  }
-
-  function formatDateTimeFromUnix(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    const y = d.getFullYear();
-    const mo = String(d.getMonth() + 1).padStart(2, '0');
-    const da = String(d.getDate()).padStart(2, '0');
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    return `${y}-${mo}-${da} ${hh}:${mm}`;
-  }
+  const tct = (ts) => new Date(ts * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' TCT';
 
   function formatCountdown(seconds) {
     if (seconds <= 0) return 'STARTING NOW';
-    const h = Math.floor(seconds / 3600);
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
-    return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+    return (d ? d + 'd ' : '') + `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
   }
 
-  async function isSuppressed() {
-    const until = Number(await GM_getValue(SUPPRESS_KEY, 0)) || 0;
-    return Date.now() < until;
+  // The faction list on a war may be an array or an object keyed by faction ID.
+  function warFactions(war) {
+    const f = war?.factions;
+    if (Array.isArray(f)) return f;
+    if (f && typeof f === 'object') return Object.entries(f).map(([id, v]) => ({ id: Number(v?.id ?? id), ...v }));
+    return [];
+  }
+
+  async function ownFactionId() {
+    const saved = Number(GM_getValue(FACTION_ID_KEY, 0));
+    if (Number.isSafeInteger(saved) && saved > 0) return saved;
+    const data = await api('faction/basic');
+    const id = Number(data?.basic?.id);
+    if (Number.isSafeInteger(id) && id > 0) GM_setValue(FACTION_ID_KEY, id);
+    return id > 0 ? id : null;
+  }
+
+  /* ----------------- RANKED WAR STATUS ----------------- */
+  async function loadState() {
+    const data = await api('faction/rankedwars', { sort: 'DESC' });
+    if (!Array.isArray(data?.rankedwars)) throw new Error('Torn did not return a ranked wars list.');
+    const now = Math.floor(Date.now() / 1000);
+    const windowSecs = SCHEDULE_WINDOW_DAYS * 86400;
+    const pending = data.rankedwars
+      .filter(war => !Number(war?.end) && Number(war?.start) > now && Number(war.start) - now <= windowSecs)
+      .sort((a, b) => Number(a.start) - Number(b.start))[0];
+    if (!pending) return { ok: true, pending: false, startTs: null, opponent: null, at: Date.now() };
+
+    // Opponent name is cosmetic: any failure here leaves it blank.
+    let opponent = null;
+    try {
+      const factions = warFactions(pending);
+      const mine = await ownFactionId();
+      const other = factions.find(f => mine && Number(f?.id) !== mine);
+      if (other?.name) opponent = String(other.name);
+    } catch (_) { /* ignore */ }
+    return { ok: true, pending: true, startTs: Number(pending.start), opponent, at: Date.now() };
+  }
+
+  function refreshState(announceErrors = false) {
+    if (!apiKey) return Promise.resolve(null);
+    if (inFlight) return inFlight;
+    inFlight = loadState()
+      .catch(error => ({ ok: false, reason: String(error?.message || error), at: Date.now() }))
+      .then(result => {
+        const wasOk = state?.ok;
+        state = result;
+        if (!result.ok && (announceErrors || wasOk !== false)) {
+          toast('Could not check ranked wars (' + result.reason + ') Training is not being guarded.', 9000);
+        }
+        return result;
+      })
+      .finally(() => { inFlight = null; });
+    return inFlight;
   }
 
   /* ----------------- HARD BLOCK ----------------- */
-  function getTrainButtons() {
-    return Array.from(document.querySelectorAll(TRAIN_BTN_SELECTOR));
-  }
-
   function setTrainButtonsBlocked(blocked) {
-    const btns = getTrainButtons();
-    for (const btn of btns) {
-      if (blocked) {
-        btn.dataset.rwEgBlocked = '1';
-        btn.style.pointerEvents = 'none'; // hard stop
-        btn.classList.add('rwEG_blocked');
-      } else {
-        btn.dataset.rwEgBlocked = '';
-        btn.style.pointerEvents = '';
-        btn.classList.remove('rwEG_blocked');
-      }
+    for (const btn of document.querySelectorAll(TRAIN_BTN_SELECTOR)) {
+      btn.dataset.rwEgBlocked = blocked ? '1' : '';
+      btn.style.pointerEvents = blocked ? 'none' : '';
+      btn.classList.toggle('rwEG_blocked', blocked);
     }
   }
 
-  function safeUnblock() {
-    modalOpen = false;
-    setTrainButtonsBlocked(false);
-  }
-
-  /* ----------------- RANKED WAR STATE (cached) ----------------- */
-  const rwCache = { ts: 0, data: null };
-
-  async function fetchRWState(apiKey) {
-    const nowMs = Date.now();
-    if (rwCache.data && (nowMs - rwCache.ts) < CACHE_TTL_MS) return rwCache.data;
-
-    // user -> faction_id
-    const uUrl = `${API_USER}?selections=basic,profile&key=${encodeURIComponent(apiKey)}&format=json`;
-    const uResp = await fetchWithTimeout(uUrl, { timeout: FETCH_TIMEOUT_MS });
-    if (!uResp.ok) {
-      const data = { ok: false, reason: `User API HTTP ${uResp.status}` };
-      rwCache.ts = nowMs; rwCache.data = data;
-      return data;
-    }
-
-    const uJson = await uResp.json();
-    const factionId = extractFactionIdFromUserJson(uJson);
-
-    if (!factionId) {
-      const data = { ok: true, factionId: null, pending: false, startTs: null, opponent: null };
-      rwCache.ts = nowMs; rwCache.data = data;
-      return data;
-    }
-
-    // faction -> ranked wars
-    const fUrl = `${API_FACTION}${encodeURIComponent(factionId)}?selections=rankedwars&key=${encodeURIComponent(apiKey)}&format=json`;
-    const fResp = await fetchWithTimeout(fUrl, { timeout: FETCH_TIMEOUT_MS });
-    if (!fResp.ok) {
-      const data = { ok: false, factionId, reason: `Faction API HTTP ${fResp.status}` };
-      rwCache.ts = nowMs; rwCache.data = data;
-      return data;
-    }
-
-    const fJson = await fResp.json();
-
-    const containers = [];
-    if (fJson.rankedwars) containers.push(fJson.rankedwars);
-    if (fJson.ranked_wars) containers.push(fJson.ranked_wars);
-    if (fJson.rankedWars) containers.push(fJson.rankedWars);
-    containers.push(fJson);
-
-    const candidates = [];
-    for (const c of containers) candidates.push(...collectWarObjects(c));
-
-    // Find the nearest future pending war within window
-    const now = Math.floor(Date.now() / 1000);
-    const windowSecs = SCHEDULE_WINDOW_DAYS * 24 * 60 * 60;
-
-    let best = null; // { obj, startTs }
-    for (const obj of candidates) {
-      const { startTs } = getWarTimes(obj);
-      const pendingByStatus = looksPending(obj);
-
-      // Primary: future start time within window
-      if (startTs && startTs > now && (startTs - now) <= windowSecs) {
-        if (!best || startTs < best.startTs) best = { obj, startTs };
-        continue;
-      }
-
-      // Fallback: has "pending" but no timestamp
-      if (!startTs && pendingByStatus) {
-        if (!best) best = { obj, startTs: null };
-      }
-    }
-
-    const opponent = best?.obj ? extractOpponentName(best.obj) : null;
-
-    const data = {
-      ok: true,
-      factionId,
-      pending: !!best,
-      startTs: best?.startTs || null,
-      opponent: opponent || null
-    };
-
-    rwCache.ts = nowMs;
-    rwCache.data = data;
-    return data;
+  function blockEvent(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
   }
 
   /* ----------------- CONFIRM MODAL ----------------- */
-  function removeModal() {
-    const old = document.getElementById('rwEG_overlay');
-    if (old) old.remove();
-    modalOpen = false;
-  }
-
-  function showConfirmModal(state, trainLabel, onContinue, onCancel) {
-    removeModal();
-    modalOpen = true;
-
-    const when = state.startTs ? formatDateTimeFromUnix(state.startTs) : 'Scheduled soon';
-    const opp = state.opponent ? `vs ${state.opponent}` : '';
+  function showConfirmModal(info, trainLabel, onContinue) {
+    modalCleanup?.();
 
     const overlay = document.createElement('div');
     overlay.id = 'rwEG_overlay';
-
     const modal = document.createElement('div');
     modal.id = 'rwEG_modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
 
-    modal.innerHTML = `
-      <h3>Confirm gym training</h3>
-      <div class="line">You clicked: <b>${escapeHtml(trainLabel || 'TRAIN')}</b></div>
-      <div class="line">Your faction has a <b>pending Ranked War</b>.</div>
-      <div class="line">
-        <b>Start:</b>
-        <span id="rwEG_countdown">${state.startTs ? 'Calculating…' : escapeHtml(when)}</span>
-        ${opp ? `<b>(${escapeHtml(opp)})</b>` : ''}
-      </div>
-      <div class="warn">Training is blocked unless you explicitly confirm.</div>
-
-      <div class="footer">
-        <label><input type="checkbox" id="rwEG_suppress"> Don’t ask again for 30 minutes</label>
-      </div>
-
-      <div class="actions">
-        <button id="rwEG_cancel">Cancel</button>
-        <button class="danger" id="rwEG_continue">Train anyway</button>
-      </div>
-    `;
-
+    const h3 = document.createElement('h3');
+    h3.textContent = 'Confirm gym training';
+    const clicked = document.createElement('div');
+    clicked.className = 'line';
+    clicked.append('You clicked: ', Object.assign(document.createElement('b'), { textContent: trainLabel || 'TRAIN' }));
+    const pendingLine = document.createElement('div');
+    pendingLine.className = 'line';
+    pendingLine.append('Your faction has a ', Object.assign(document.createElement('b'), { textContent: 'pending Ranked War' }),
+      info.opponent ? ' vs ' : '.', ...(info.opponent ? [Object.assign(document.createElement('b'), { textContent: info.opponent }), '.'] : []));
+    const startLine = document.createElement('div');
+    startLine.className = 'line';
+    const countdown = Object.assign(document.createElement('span'), { id: 'rwEG_countdown' });
+    startLine.append(Object.assign(document.createElement('b'), { textContent: 'Starts in: ' }), countdown,
+      info.startTs ? ' (' + tct(info.startTs) + ')' : '');
+    const warn = Object.assign(document.createElement('div'), { className: 'warn', textContent: 'Training is blocked unless you explicitly confirm.' });
+    const footer = document.createElement('div');
+    footer.className = 'footer';
+    const label = document.createElement('label');
+    const suppress = Object.assign(document.createElement('input'), { type: 'checkbox', id: 'rwEG_suppress' });
+    label.append(suppress, ' Don’t ask again for 30 minutes');
+    footer.append(label);
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const cancelBtn = Object.assign(document.createElement('button'), { type: 'button', id: 'rwEG_cancel', textContent: 'Cancel' });
+    const continueBtn = Object.assign(document.createElement('button'), { type: 'button', id: 'rwEG_continue', className: 'danger', textContent: 'Train anyway' });
+    actions.append(cancelBtn, continueBtn);
+    modal.append(h3, clicked, pendingLine, startLine, warn, footer, actions);
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
-    // Live countdown (local only; no extra API calls)
-    let countdownTimer = null;
-    if (state.startTs) {
-      const el = document.getElementById('rwEG_countdown');
-      const tick = () => {
-        const now = Math.floor(Date.now() / 1000);
-        const remaining = state.startTs - now;
-        el.textContent = formatCountdown(remaining);
-      };
-      tick();
-      countdownTimer = setInterval(tick, 1000);
+    // Local countdown only; no API calls.
+    const tick = () => { countdown.textContent = info.startTs ? formatCountdown(info.startTs - Math.floor(Date.now() / 1000)) : 'soon'; };
+    tick();
+    const timer = setInterval(tick, 1000);
+
+    const escHandler = (e) => { if (e.key === 'Escape') { blockEvent(e); close(); } };
+    function close() {
+      clearInterval(timer);
+      window.removeEventListener('keydown', escHandler, true);
+      overlay.remove();
+      setTrainButtonsBlocked(false);
+      modalCleanup = null;
     }
+    modalCleanup = close;
 
-    const stopTimer = () => {
-      if (countdownTimer) {
-        clearInterval(countdownTimer);
-        countdownTimer = null;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    cancelBtn.addEventListener('click', close);
+    continueBtn.addEventListener('click', () => {
+      if (suppress.checked) {
+        suppressUntil = Date.now() + SUPPRESS_MS;
+        GM_setValue(SUPPRESS_KEY, suppressUntil);
       }
-    };
-
-    const doCancel = () => {
-      stopTimer();
-      try { onCancel?.(); } catch (_) {}
-    };
-
-    const doContinue = async () => {
-      stopTimer();
-      try {
-        const chk = modal.querySelector('#rwEG_suppress');
-        if (chk?.checked) {
-          await GM_setValue(SUPPRESS_KEY, Date.now() + SUPPRESS_MS);
-        }
-      } catch (_) {}
-      try { onContinue?.(); } catch (_) {}
-    };
-
-    // background click = cancel
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) doCancel();
+      close();
+      onContinue();
     });
-
-    modal.querySelector('#rwEG_cancel').addEventListener('click', doCancel);
-    modal.querySelector('#rwEG_continue').addEventListener('click', doContinue);
-
-    // ESC = cancel
-    const escHandler = (e) => {
-      if (e.key === 'Escape') {
-        window.removeEventListener('keydown', escHandler, true);
-        doCancel();
-      }
-    };
     window.addEventListener('keydown', escHandler, true);
+    cancelBtn.focus();
   }
 
-  /* ----------------- INTERCEPT ONLY TRAIN BUTTONS ----------------- */
-  function getTrainLabel(btn) {
-    const aria = btn.getAttribute('aria-label') || '';
-    if (aria.trim()) return aria.trim(); // e.g. "Train speed"
-    return (btn.textContent || 'TRAIN').trim();
-  }
+  /* ----------------- INTERCEPT TRAIN CLICKS ----------------- */
+  // Decides synchronously. Any `await` before blocking would let Torn's own
+  // click handler run first and spend the energy.
+  function onClick(e) {
+    if (bypassOnce) return;
+    const btn = e.target?.closest?.(TRAIN_BTN_SELECTOR);
+    if (!btn) return;
 
-  function installTrainButtonInterceptor(getState) {
-    document.addEventListener('click', async (e) => {
-      // Allow the confirmed re-click through
-      if (bypassOnce) return;
+    if (modalCleanup) { blockEvent(e); return; }
+    if (!apiKey || Date.now() < suppressUntil) return;
 
-      const btn = e.target?.closest?.(TRAIN_BTN_SELECTOR);
-      if (!btn) return;
+    if (!state) {
+      // Status not known yet: hold this click rather than risk spending energy.
+      blockEvent(e);
+      toast('Checking ranked war status… click TRAIN again in a moment.', 4000);
+      refreshState();
+      return;
+    }
+    if (Date.now() - state.at > REFRESH_MS) refreshState();   // background refresh; uses the last known status now
+    if (!state.ok || !state.pending) return;
 
-      // If modal is already open, block further clicks
-      if (modalOpen) {
-        e.preventDefault();
-        e.stopPropagation();
-        e.stopImmediatePropagation?.();
-        return;
-      }
-
-      // If user suppressed prompts, allow normal behavior
-      if (await isSuppressed()) return;
-
-      const state = await getState();
-      if (!state?.ok) return;
-
-      // Only block for PENDING as requested
-      if (!state.pending) return;
-
-      // HARD BLOCK: disable all train buttons FIRST (prevents any leakage)
-      setTrainButtonsBlocked(true);
-
-      // Block this click
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation?.();
-
-      const label = getTrainLabel(btn);
-
-      showConfirmModal(
-        state,
-        label,
-        () => {
-          // CONTINUE: enable, then re-click once
-          removeModal();
-          setTrainButtonsBlocked(false);
-
-          bypassOnce = true;
-          try {
-            btn.click();
-          } finally {
-            setTimeout(() => (bypassOnce = false), 150);
-          }
-        },
-        () => {
-          // CANCEL: enable, do not train
-          removeModal();
-          setTrainButtonsBlocked(false);
-        }
-      );
-    }, true);
-
-    // Safety: if tab returns visible and no modal, ensure buttons aren't left blocked
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && !modalOpen) {
-        setTrainButtonsBlocked(false);
-      }
+    blockEvent(e);
+    setTrainButtonsBlocked(true);
+    const label = (btn.getAttribute('aria-label') || btn.textContent || 'TRAIN').trim();
+    showConfirmModal(state, label, () => {
+      // One confirmed click → exactly one click on the chosen TRAIN button.
+      bypassOnce = true;
+      try { btn.click(); } finally { bypassOnce = false; }
     });
   }
 
   /* ----------------- MAIN ----------------- */
-  async function main() {
-    const apiKey = await ensureApiKey();
-    if (!apiKey) return;
+  function main() {
+    document.addEventListener('click', onClick, true);
+    window.addEventListener('pagehide', () => modalCleanup?.());
 
-    async function getState() {
-      try {
-        return await fetchRWState(apiKey);
-      } catch (err) {
-        return { ok: false, reason: String(err?.message || err) };
-      }
+    // Background API refreshes do nothing until a key is set.
+    setInterval(() => { if (document.visibilityState === 'visible') refreshState(); }, REFRESH_MS);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!modalCleanup) setTrainButtonsBlocked(false);
+      if (!state || Date.now() - state.at > REFRESH_MS) refreshState();
+    });
+
+    if (apiKey) {
+      refreshState();
+    } else if (!GM_getValue(PROMPTED_KEY, false)) {
+      // Ask once; after that the menu command is the way to add a key.
+      GM_setValue(PROMPTED_KEY, true);
+      setApiKey();
+    } else {
+      toast('No API key set, so training is not guarded. Use the Tampermonkey menu → Set API key.', 8000);
     }
-
-    // Never leave buttons locked
-    window.addEventListener('beforeunload', () => safeUnblock());
-
-    installTrainButtonInterceptor(getState);
-
-    // Warm cache once
-    getState().catch(() => {});
   }
 
-  main().catch(console.error);
-
+  main();
 })();
